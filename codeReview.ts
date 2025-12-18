@@ -5,10 +5,17 @@ import { TransactWriteCommandInput } from "@aws-sdk/lib-dynamodb";
 const SHIPPING_MAX_ITEMS = 15;
 const dynamoDb = createDynamoDbDocumentClient();
 
-// Call this function to start the withdraw process.
-// Existing orders are pending for 24 hours, or until the order hits 15 items, then they move to processing.
-// A cron job updates the orders when they hit 24 hours, it's outside the scope of this function.
-// Types, Enums, Helpers, and Dynamodb logic is generally correct
+/*
+    This is an exercise to review the "withdraw" function.
+    Code within types, enums, helpers, and dynamodb logic is generally correct, so don't focus on that.
+    There are a few bugs, as well as some areas where best practices are not followed.
+    Read through the code first, and ask any questions you have, and then we will talk through the code as a code review.
+
+    The purpose of this function is to start the withdraw process for a given account and items.
+    Existing orders are pending for 24 hours, or until the order hits 15 items, then they move to processing.
+    A cron job updates the orders when they hit 24 hours, it's outside the scope of this function.
+*/
+
 export default async function withdraw(account: AccountDdb, items: InventoryItemDdb[]) {
   if (items.length > 200) {
     throw new Error("Cannot withdraw that many items at once");
@@ -138,7 +145,7 @@ function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
       TableName: "INVENTORY",
       Key: { pk: item.pk, sk: item.sk },
       ConditionExpression: "attribute_exists(pk) AND #status = :expectedStatus",
-      UpdateExpression: "SET #status = :status, updatedAt = :updatedAt, gsi1sk = :gsi1sk",
+      UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: {
         ":status": InventoryItemStatus.WITHDRAWING,
@@ -152,8 +159,7 @@ function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
 async function getPendingOrder(accountId: string): Promise<TcgOrderDdb | undefined> {
   const result = await dynamoDb.query({
     TableName: "ORDER",
-    IndexName: "GSI1",
-    KeyConditionExpression: "gsi1pk = :accountId",
+    KeyConditionExpression: "pk = :accountId",
     FilterExpression: "#status = :pending",
     ExpressionAttributeNames: {
       "#status": "status",
@@ -195,14 +201,12 @@ type TcgOrderDdb = {
   items: InventoryItemDdb[];
 };
 
-export type ShippingAddress = {
+type ShippingAddress = {
   firstName: string;
   lastName: string;
   addressLine1: string;
   addressLine2?: string;
-  // City, Municipality, etc.
   locality: string;
-  // State, Province, etc.
   region: string;
   postalCode: string;
   country: string;
