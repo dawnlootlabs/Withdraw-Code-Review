@@ -13,6 +13,7 @@ const dynamoDb = createDynamoDbDocumentClient();
 
     The purpose of this function is to start the withdraw process for a given account and items.
     Pending orders have up to 14 items, and once they hit 15 items, they move to processing. 
+    There is max 1 pending order at a given time.
 */
 
 export default async function withdraw(account: AccountDdb, items: InventoryItemDdb[]) {
