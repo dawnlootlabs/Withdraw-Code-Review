@@ -12,8 +12,7 @@ const dynamoDb = createDynamoDbDocumentClient();
     Read through the code first, and ask any questions you have, and then we will talk through the code as a code review.
 
     The purpose of this function is to start the withdraw process for a given account and items.
-    Existing orders are pending for 24 hours, or until the order hits 15 items, then they move to processing.
-    A cron job updates the orders when they hit 24 hours, it's outside the scope of this function.
+    Pending orders have up to 14 items, and once they hit 15 items, they move to processing. 
 */
 
 export default async function withdraw(account: AccountDdb, items: InventoryItemDdb[]) {
@@ -38,19 +37,19 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
     const len = pendingOrder.items.length;
 
     const remainder = len - SHIPPING_MAX_ITEMS;
-    const i = items.slice(0, remainder);
+    const iToAdd = items.slice(0, remainder);
 
     let status: TcgOrderStatus;
     const updateExpression =
       "SET #status = :status, updatedAt = :updatedAt, #items = list_append(#items, :orderItems)";
-    if (remainder === i.length) {
+    if (remainder === iToAdd.length) {
       status = TcgOrderStatus.PROCESSING;
       processingOrderIds.push(pendingOrder.pk);
     } else {
       status = TcgOrderStatus.PENDING;
     }
 
-    const inventoryItemUpdates = getInventoryItemUpdates(i, date.toISOString());
+    const inventoryItemUpdates = getInventoryItemUpdates(iToAdd, date.toISOString());
 
     params.TransactItems?.push(
       {
@@ -62,7 +61,7 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
           ExpressionAttributeNames: { "#status": "status", "#items": "items" },
           ExpressionAttributeValues: {
             ":status": status,
-            ":orderItems": i,
+            ":orderItems": iToAdd,
             ":updatedAt": date.toISOString(),
             ":expectedStatus": TcgOrderStatus.PENDING,
           },
@@ -71,15 +70,15 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
       ...inventoryItemUpdates
     );
 
-    i.forEach((item) => {
+    iToAdd.forEach((item) => {
       item.status = InventoryItemStatus.WITHDRAWING;
       item.updatedAt = date.toISOString();
     });
     pendingOrder.status = status;
     pendingOrder.updatedAt = date.toISOString();
-    pendingOrder.items.push(...i);
+    pendingOrder.items.push(...iToAdd);
 
-    orders.push({ tcgOrder: pendingOrder, items: i.map((item) => item) });
+    orders.push({ tcgOrder: pendingOrder, items: iToAdd.map((item) => item) });
   }
 
   const shippingAddress = account.shippingAddress;
@@ -139,6 +138,8 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
 }
 
 // Helpers
+
+// returns dynamodb update items for a list of inventory items
 function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
   return items.map((item) => ({
     Update: {
@@ -156,6 +157,7 @@ function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
   }));
 }
 
+// gets the current open pending order for an account
 async function getPendingOrder(accountId: string): Promise<TcgOrderDdb | undefined> {
   const result = await dynamoDb.query({
     TableName: "ORDER",
