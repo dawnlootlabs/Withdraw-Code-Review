@@ -2,7 +2,7 @@ import { createDynamoDbDocumentClient } from "@boxed-backend/core/utils/dynamodb
 import { monotonicFactory } from "node_modules/ulidx/dist/ulid";
 import { TransactWriteCommandInput } from "@aws-sdk/lib-dynamodb";
 
-const SHIPPING_MAX_ITEMS = 15;
+const MAX_ITEMS_PER_ORDER = 15;
 const dynamoDb = createDynamoDbDocumentClient();
 
 /*
@@ -11,9 +11,14 @@ const dynamoDb = createDynamoDbDocumentClient();
     There are a few bugs, as well as some areas where best practices are not followed.
     Read through the code first, and ask any questions you have, and then we will talk through the code as a code review.
 
-    The purpose of this function is to start the withdraw process for a given account and items.
-    Pending orders have up to 14 items, and once they hit 15 items, they move to processing. 
-    There is max 1 pending order at a given time.
+    The goal of this function is to withdraw items from an account by adding them to orders.
+    Items can either be added to an existing pending order, or new orders can be created.
+    Pending orders can have up to 14 items, and once they have 15 items, they move to processing.
+
+    The withdraw function is successful if:
+     - It successfully adds all inputted items to orders
+     - There is max 1 pending order at a given time per account
+     - Orders with 15 items are updated to processing
 */
 
 export default async function withdraw(account: AccountDdb, items: InventoryItemDdb[]) {
@@ -21,65 +26,36 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
     throw new Error("Cannot withdraw that many items at once");
   }
 
-  const orders: { tcgOrder: TcgOrderDdb; items: InventoryItemDdb[] }[] = [];
-
   const accountId = account.pk;
+  const orders: TcgOrderDdb[] = [];
   const date = new Date();
   const ulid = monotonicFactory();
-
-  const pendingOrder = await getPendingOrder(account.pk);
-
   const params: TransactWriteCommandInput = {
     TransactItems: [],
   };
 
-  const processingOrderIds: string[] = [];
+  const pendingOrder = await getPendingOrder(account.pk);
+
   if (pendingOrder) {
     const len = pendingOrder.items.length;
 
-    const remainder = len - SHIPPING_MAX_ITEMS;
+    const remainder = len - MAX_ITEMS_PER_ORDER;
     const iToAdd = items.slice(0, remainder);
 
-    let status: TcgOrderStatus;
-    const updateExpression =
-      "SET #status = :status, updatedAt = :updatedAt, #items = list_append(#items, :orderItems)";
-    if (remainder === iToAdd.length) {
+    let status: TcgOrderStatus = TcgOrderStatus.PENDING;
+
+    if (remainder == iToAdd.length) {
       status = TcgOrderStatus.PROCESSING;
-      processingOrderIds.push(pendingOrder.pk);
-    } else {
-      status = TcgOrderStatus.PENDING;
     }
 
-    const inventoryItemUpdates = getInventoryItemUpdates(iToAdd, date.toISOString());
-
-    params.TransactItems?.push(
-      {
-        Update: {
-          TableName: "ORDER",
-          Key: { pk: pendingOrder.pk },
-          ConditionExpression: "attribute_exists(pk) AND #status = :expectedStatus",
-          UpdateExpression: updateExpression,
-          ExpressionAttributeNames: { "#status": "status", "#items": "items" },
-          ExpressionAttributeValues: {
-            ":status": status,
-            ":orderItems": iToAdd,
-            ":updatedAt": date.toISOString(),
-            ":expectedStatus": TcgOrderStatus.PENDING,
-          },
-        },
-      },
-      ...inventoryItemUpdates
-    );
-
-    iToAdd.forEach((item) => {
-      item.status = InventoryItemStatus.WITHDRAWING;
-      item.updatedAt = date.toISOString();
-    });
     pendingOrder.status = status;
     pendingOrder.updatedAt = date.toISOString();
     pendingOrder.items.push(...iToAdd);
 
-    orders.push({ tcgOrder: pendingOrder, items: iToAdd.map((item) => item) });
+    params.TransactItems?.push(...getInventoryItemUpdates(iToAdd, date.toISOString()));
+    params.TransactItems?.push(getTcgOrderUpdate(pendingOrder));
+
+    orders.push(pendingOrder);
   }
 
   const shippingAddress = account.shippingAddress;
@@ -87,17 +63,15 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
     throw new Error("shipping address invalid");
   }
 
+  // split items into orders of MAX_ITEMS_PER_ORDER
   const itemsForNewOrders: InventoryItemDdb[][] = [];
-  for (let i = 0; i < items.length; i += SHIPPING_MAX_ITEMS) {
-    itemsForNewOrders.push(items.slice(i, i + SHIPPING_MAX_ITEMS));
+  for (let i = 0; i < items.length; i += MAX_ITEMS_PER_ORDER) {
+    itemsForNewOrders.push(items.slice(i, i + MAX_ITEMS_PER_ORDER));
   }
 
+  // create new orders for each batch of items
   for (const itemsForNewOrder of itemsForNewOrders) {
     const tcgOrderId = ulid(date.getTime());
-
-    if (itemsForNewOrder.length === SHIPPING_MAX_ITEMS) {
-      processingOrderIds.push(tcgOrderId);
-    }
 
     const newTcgOrder: TcgOrderDdb = {
       pk: tcgOrderId,
@@ -109,25 +83,17 @@ export default async function withdraw(account: AccountDdb, items: InventoryItem
       items: itemsForNewOrder,
     };
 
-    const inventoryItemUpdates = getInventoryItemUpdates(itemsForNewOrder, date.toISOString());
+    params.TransactItems?.push(...getInventoryItemUpdates(itemsForNewOrder, date.toISOString()));
 
-    params.TransactItems?.push(
-      {
-        Put: {
-          TableName: "ORDER",
-          Item: newTcgOrder,
-          ConditionExpression: "attribute_not_exists(pk)",
-        },
+    params.TransactItems?.push({
+      Put: {
+        TableName: "ORDER",
+        Item: newTcgOrder,
+        ConditionExpression: "attribute_not_exists(pk)",
       },
-      ...inventoryItemUpdates
-    );
-
-    itemsForNewOrder.forEach((item) => {
-      item.status = InventoryItemStatus.WITHDRAWING;
-      item.updatedAt = date.toISOString();
     });
 
-    orders.push({ tcgOrder: newTcgOrder, items: itemsForNewOrder.map((item) => item) });
+    orders.push(newTcgOrder);
   }
 
   await dynamoDb.transactWrite(params);
@@ -150,7 +116,7 @@ function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
       UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: {
-        ":status": InventoryItemStatus.WITHDRAWING,
+        ":status": InventoryItemStatus.WITHDRAWN,
         ":updatedAt": dateStr,
         ":expectedStatus": InventoryItemStatus.UNFULFILLED,
       },
@@ -158,7 +124,26 @@ function getInventoryItemUpdates(items: InventoryItemDdb[], dateStr: string) {
   }));
 }
 
-// gets the current open pending order for an account
+// returns dynamodb update item for a tcg order
+function getTcgOrderUpdate(pendingOrder: TcgOrderDdb) {
+  return {
+    Update: {
+      TableName: "ORDER",
+      Key: { pk: pendingOrder.pk },
+      ConditionExpression: "attribute_exists(pk) AND #status = :expectedStatus",
+      UpdateExpression: "SET #status = :status, updatedAt = :updatedAt, #items = :items",
+      ExpressionAttributeNames: { "#status": "status", "#items": "items" },
+      ExpressionAttributeValues: {
+        ":status": pendingOrder.status,
+        ":items": pendingOrder.items,
+        ":updatedAt": pendingOrder.updatedAt,
+        ":expectedStatus": TcgOrderStatus.PENDING,
+      },
+    },
+  };
+}
+
+// gets the current open pending order for an account if it exists
 async function getPendingOrder(accountId: string): Promise<TcgOrderDdb | undefined> {
   const result = await dynamoDb.query({
     TableName: "ORDER",
@@ -181,14 +166,14 @@ async function getPendingOrder(accountId: string): Promise<TcgOrderDdb | undefin
 // Types
 type AccountDdb = {
   pk: string;
+  email: string;
   shippingAddress?: ShippingAddress;
 };
 
 type InventoryItemDdb = {
   pk: string;
   sk: string;
-  exchangeAddTxId?: string;
-  exchangeRemoveTxId?: string;
+  name: string;
   createdAt: string;
   updatedAt: string;
   status: InventoryItemStatus;
@@ -226,6 +211,5 @@ enum TcgOrderStatus {
 
 enum InventoryItemStatus {
   UNFULFILLED = "UNFULFILLED",
-  WITHDRAWING = "WITHDRAWING",
   WITHDRAWN = "WITHDRAWN",
 }
